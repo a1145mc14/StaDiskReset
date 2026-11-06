@@ -67,6 +67,15 @@ StaDiskReset --carve E: --extract json --min-size 50000 --out D:\恢复
 - **常驻数据**：`< 700 B` 的小文件数据在 MFT 记录里，现已直接还原（不再被跳过）
 - **run 查找**：`readStream` 用 `std::upper_bound` 替代线性扫，高度碎片化文件恢复更快
 - **`--pattern-hex`**：先去非 hex 字符再两位一组，`4A53` 和 `4A 53` 都能正确解析
+## 修复记录（v1.1.3）
+
+- **`--limit` 只出一半**：`shown` 在循环里自增两次，`--limit 50` 实际只列 25 条
+- **`$STANDARD_INFORMATION` 越界读**：`vlen >= 16` 却读到 `v+23`，改为 `>= 24`
+- **被截断的恢复不报警**：`readStream` 中途失败时仍打印「已恢复」，现在会标「⚠ 部分恢复 x / y（百分比）」
+- **长 pattern 跨块静默跳过**：边界窗口原来用定长 `u8[160]`，`patLen > 81` 时整段跳过，改为 `std::vector`
+- **数值参数负数**：`atoi("-1")` 转 `u32` 变成 4294967295，改用 `_strtoi64` + 负值钳 0
+- **不再污染父 shell 代码页**：去掉 `system("chcp 65001")`，改用 `SetConsoleOutputCP` 并在退出时 `atexit` 恢复原 CP
+- **`readBytes` 长度溢出**：`pre + len + 511` 在极端长度下会溢出 `u32`，加了前置检查
 ## 命令一览
 
 | 参数 | 说明 |

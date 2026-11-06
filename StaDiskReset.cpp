@@ -182,6 +182,7 @@ struct Volume {
         u64 aoff = off & ~511ull;
         u32 pre = (u32)(off - aoff);
         if (pre == 0 && (len & 511u) == 0) return readAligned(off, buf, len);
+        if (pre > 0xFFFFFFFFu - len - 511u) return false;   // 防 u32 加法溢出
         u32 total = (pre + len + 511u) & ~511u;
         u8* tmp = (u8*)malloc(total);
         if (!tmp) return false;
@@ -306,7 +307,7 @@ static bool parseRecord(u8* rec, u32 recSize, u32 sectorSize, u64 recno, MftEntr
             u16 voff = *(u16*)(rec + off + 0x14);
             const u8* v = rec + off + voff;
             if (voff + vlen <= alen) {
-                if (vlen >= 16) {
+                if (vlen >= 24) {          // 至少要有到 mftTime 末尾的 24 字节
                     e.ctime = *(u64*)(v + 0);
                     e.mtime = *(u64*)(v + 8);
                     e.mftTime = *(u64*)(v + 16);
@@ -624,19 +625,17 @@ static bool carve(ScanCtx& ctx, const vector<Run>& scanRuns, const CarveOpt& opt
 
                 // 2) 跨块边界：用单独的小窗口比对，不动 buf
                 if (!carry.empty() && !(opt.limit && hits >= opt.limit)) {
-                    u8 small[160];
                     size_t t = carry.size();
                     size_t take = std::min<size_t>((size_t)want, patLen - 1);
-                    if (t + take <= sizeof(small)) {
-                        memcpy(small, carry.data(), t);
-                        memcpy(small + t, buf, take);
-                        size_t tot = t + take;
-                        for (size_t sp = 0; sp + patLen <= tot; sp++) {
-                            if (sp + patLen <= t) continue;   // 完全落在上一块，已经搜过
-                            if (memcmp(small + sp, opt.pattern.data(), patLen) != 0) continue;
-                            u64 abs = phys - (u64)t + (u64)sp;
-                            if (!handleHit(abs)) break;
-                        }
+                    std::vector<u8> small(t + take);      // 不限定 pattern 长度
+                    memcpy(small.data(), carry.data(), t);
+                    memcpy(small.data() + t, buf, take);
+                    size_t tot = t + take;
+                    for (size_t sp = 0; sp + patLen <= tot; sp++) {
+                        if (sp + patLen <= t) continue;   // 完全落在上一块，已经搜过
+                        if (memcmp(small.data() + sp, opt.pattern.data(), patLen) != 0) continue;
+                        u64 abs = phys - (u64)t + (u64)sp;
+                        if (!handleHit(abs)) break;
                     }
                 }
 
@@ -717,7 +716,7 @@ static bool carve(ScanCtx& ctx, const vector<Run>& scanRuns, const CarveOpt& opt
 static void help() {
     out(
     "StaDiskReset —— 磁盘已删除文件恢复 / 内容特征扫描\n"
-    "版本 1.1.2   只读工具，不会修改源盘\n\n"
+    "版本 1.1.3   只读工具，不会修改源盘\n\n"
     "用法：\n"
     "  StaDiskReset --info   E:\n"
     "  StaDiskReset --list   E:  [--all] [--name \"*.json\"] [--limit 50]\n"
@@ -754,9 +753,19 @@ static void help() {
 static int runArgs(const vector<string>& args);
 static int interactiveMenu();
 
+static UINT g_oldOutCP = 0;
+static UINT g_oldInCP = 0;
+
+static void restoreCodePage() {
+    if (g_oldOutCP) SetConsoleOutputCP(g_oldOutCP);
+    if (g_oldInCP) SetConsoleCP(g_oldInCP);
+}
+
 int main() {
-    // 中文不乱码：控制台代码页切到 UTF-8
-    system("chcp 65001 >nul");
+    // 中文不乱码：只改本控制台的代码页，退出时恢复（不用 system("chcp") 污染父 shell）
+    g_oldOutCP = GetConsoleOutputCP();
+    g_oldInCP = GetConsoleCP();
+    atexit(restoreCodePage);
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
     g_tty = _isatty(_fileno(stdout)) != 0;
@@ -798,10 +807,10 @@ static int runArgs(const vector<string>& args) {
         else if (a == "--pattern") pattern = need("--pattern");
         else if (a == "--pattern-hex") patternHex = need("--pattern-hex");
         else if (a == "--extract") extract = need("--extract");
-        else if (a == "--context") contextKB = (u32)atoi(need("--context").c_str());
-        else if (a == "--min-size") minSize = (u32)atoi(need("--min-size").c_str());
-        else if (a == "--max-size") maxSize = (u32)atoi(need("--max-size").c_str());
-        else if (a == "--limit") limit = (u64)_strtoui64(need("--limit").c_str(), nullptr, 10);
+        else if (a == "--context") { long long v = _strtoi64(need("--context").c_str(), nullptr, 10); contextKB = (u32)(v > 0 ? v : 0); }
+        else if (a == "--min-size") { long long v = _strtoi64(need("--min-size").c_str(), nullptr, 10); minSize = (u32)(v > 0 ? v : 0); }
+        else if (a == "--max-size") { long long v = _strtoi64(need("--max-size").c_str(), nullptr, 10); maxSize = (u32)(v > 0 ? v : 0); }
+        else if (a == "--limit") { long long v = _strtoi64(need("--limit").c_str(), nullptr, 10); limit = (u64)(v > 0 ? v : 0); }
         else if (a == "--out") outDir = need("--out");
         else if (a.size() >= 1 && a[0] != '-') { if (volStr.empty()) volStr = a; }
         else { printf("未知参数：%s\n", a.c_str()); return 1; }
@@ -820,7 +829,7 @@ static int runArgs(const vector<string>& args) {
     Volume vol;
     if (!vol.open((wchar_t)L, err)) { printf("打开 %c: 失败：%s\n", L, err.c_str()); return 1; }
 
-    printf("StaDiskReset 1.1.2   源卷 %c:\n", L);
+    printf("StaDiskReset 1.1.3   源卷 %c:\n", L);
     printf("  簇大小 %s   总簇数 %llu   容量 %s\n\n",
            fmtSize(vol.clusterSize).c_str(), (unsigned long long)vol.totalClusters,
            fmtSize(vol.clusterSize * vol.totalClusters).c_str());
@@ -905,13 +914,19 @@ static int runArgs(const vector<string>& args) {
                             free(buf);
                         }
                         CloseHandle(fh);
-                        printf("  已恢复 %s -> %s%s\n", fmtSize(written).c_str(), W2U(outPath).c_str(),
-                               isResident ? "（常驻数据）" : "");
+                        if (sz > 0 && written < sz) {
+                            printf("  ⚠ 部分恢复 %s / %s（%llu%%）-> %s\n",
+                                   fmtSize(written).c_str(), fmtSize(sz).c_str(),
+                                   (unsigned long long)(written * 100 / sz), W2U(outPath).c_str());
+                        } else {
+                            printf("  已恢复 %s -> %s%s\n", fmtSize(written).c_str(), W2U(outPath).c_str(),
+                                   isResident ? "（常驻数据）" : "");
+                        }
                     }
                 }
             }
-            if (limit && ++shown >= limit) break;
             shown++;
+            if (limit && shown >= limit) break;
         }
         printf("\n共 %llu 条\n", (unsigned long long)shown);
         return 0;
@@ -1036,7 +1051,7 @@ static int interactiveMenu() {
 TOP:
     system("cls");
     cout << "===============================================" << endl;
-    cout << "        StaDiskReset 1.1.2  磁盘恢复工具箱" << endl;
+    cout << "        StaDiskReset 1.1.3  磁盘恢复工具箱" << endl;
     cout << "          双击即用 · 只读不写源盘" << endl;
     cout << "===============================================" << endl;
     cout << "1. 卷信息（簇大小 / MFT 位置）" << endl;
