@@ -200,10 +200,12 @@ struct Volume {
         u64 vcn = off / clusterSize;
         u32 offInCl = (u32)(off % clusterSize);
         while (done < len) {
-            const Run* r = nullptr;
-            for (size_t i = 0; i < runs.size(); i++)
-                if (vcn >= runs[i].vcn && vcn < runs[i].vcn + runs[i].count) { r = &runs[i]; break; }
-            if (!r) return false;
+            auto it = std::upper_bound(runs.begin(), runs.end(), vcn,
+                                       [](u64 v, const Run& rr) { return v < rr.vcn; });
+            if (it == runs.begin()) return false;
+            --it;
+            if (vcn >= it->vcn + it->count) return false;
+            const Run* r = &(*it);
             u64 clIdx = vcn - r->vcn;
             u64 phys = (u64)(r->lcn + (i64)clIdx) * clusterSize + offInCl;
             u64 room = (r->count - clIdx) * clusterSize - offInCl;
@@ -262,6 +264,7 @@ struct MftEntry {
     u8   ns = 0;
     string name;
     vector<Run> runs;
+    vector<u8> resident;      // 常驻属性数据（小文件就在 MFT 记录里）
 };
 
 static bool applyFixup(u8* rec, u32 recSize, u32 sectorSize) {
@@ -341,8 +344,13 @@ static bool parseRecord(u8* rec, u32 recSize, u32 sectorSize, u64 recno, MftEntr
                 }
             } else {
                 u16 vlen = *(u16*)(rec + off + 0x10);
+                u16 voff = *(u16*)(rec + off + 0x14);
                 e.dataSize = vlen;
                 e.hasData = true;
+                if (vlen > 0 && (u32)voff + (u32)vlen <= alen) {
+                    const u8* v = rec + off + voff;
+                    e.resident.assign(v, v + vlen);
+                }
             }
         }
         off += alen;
@@ -545,10 +553,14 @@ static bool carve(ScanCtx& ctx, const vector<Run>& scanRuns, const CarveOpt& opt
     Volume& v = *ctx.vol;
     u64 totalBytes = 0;
     for (auto& r : scanRuns) totalBytes += r.count * v.clusterSize;
+    const u64 volBytes = v.clusterSize * v.totalClusters;   // 物理寻址上界
 
     const u32 CHUNK = 16u * 1024u * 1024u;
     u8* buf = (u8*)VirtualAlloc(nullptr, CHUNK, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!buf) { err = "内存分配失败"; return false; }
+
+    const size_t patLen = opt.pattern.size();
+    vector<u8> carry;      // 上一块末尾的 patLen-1 字节
 
     u64 done = 0, hits = 0;
     LARGE_INTEGER freq, t0, t1;
@@ -560,19 +572,17 @@ static bool carve(ScanCtx& ctx, const vector<Run>& scanRuns, const CarveOpt& opt
         const Run& r = scanRuns[ri];
         u64 bytes = r.count * v.clusterSize;
         u64 pos = 0;
+        carry.clear();     // run 之间物理不连续，不能跨块拼接
         while (pos < bytes) {
             u32 want = (u32)std::min<u64>(CHUNK, bytes - pos);
             u64 phys = (u64)r.lcn * v.clusterSize + pos;
+            // 注意：原始卷读要求偏移/长度/缓冲区都按扇区对齐，这里 buf 由 VirtualAlloc 给出，
+            // 永远是页对齐的，绝不能把 carry 拼到 buf 前面再读。
             if (!v.readBytes(phys, buf, want)) { pos += want; done += want; continue; }
             done += want;
 
-            if (!opt.jsonMode) {
-                const u8* p = buf;
-                size_t rem = want;
-                while (true) {
-                    const u8* q = memFind(p, rem, opt.pattern.data(), opt.pattern.size());
-                    if (!q) break;
-                    u64 abs = phys + (u64)(q - buf);
+            if (!opt.jsonMode && patLen > 0) {
+                auto handleHit = [&](u64 abs) -> bool {
                     hits++;
                     char line[256];
                     snprintf(line, sizeof line, "\n  命中 #%llu  偏移 0x%llX  空闲区 %llu\n",
@@ -581,26 +591,62 @@ static bool carve(ScanCtx& ctx, const vector<Run>& scanRuns, const CarveOpt& opt
                     out(line);
                     if (!opt.outDir.empty()) {
                         u32 ctxBytes = opt.contextKB * 1024u;
-                        u64 start = abs > ctxBytes / 2 ? abs - ctxBytes / 2 : 0;
-                        start &= ~511ull;
-                        u64 end = std::min<u64>(abs + ctxBytes, totalBytes);
-                        u32 cb = (u32)((end - start) & ~511ull);
-                        u8* cbuf = (u8*)malloc(cb);
-                        if (cb && cbuf && v.readBytes(start, cbuf, cb)) {
-                            char name[512];
-                            snprintf(name, sizeof name, "%s\\hit_%016llX.bin", opt.outDir.c_str(),
-                                     (unsigned long long)abs);
-                            if (writeFileBytes(name, cbuf, cb)) out("  已保存上下文片段\n");
+                        u64 st = abs > ctxBytes / 2 ? abs - ctxBytes / 2 : 0;
+                        st &= ~511ull;
+                        u64 en = std::min<u64>(abs + (u64)ctxBytes, volBytes);
+                        if (en > st) {
+                            u32 cb = (u32)std::min<u64>(en - st, (u64)ctxBytes);
+                            cb &= ~511u;
+                            if (cb) {
+                                u8* cbuf = (u8*)malloc(cb);
+                                if (cbuf && v.readBytes(st, cbuf, cb)) {
+                                    char name[512];
+                                    snprintf(name, sizeof name, "%s\\hit_%016llX.bin", opt.outDir.c_str(),
+                                             (unsigned long long)abs);
+                                    if (writeFileBytes(name, cbuf, cb)) out("  已保存上下文片段\n");
+                                }
+                                free(cbuf);
+                            }
                         }
-                        free(cbuf);
                     }
-                    p = q + 1;
-                    rem = (size_t)((buf + want) - p);
-                    if (opt.limit && hits >= opt.limit) break;
+                    return !(opt.limit && hits >= opt.limit);
+                };
+
+                // 1) 块内匹配
+                size_t idx = 0;
+                while (idx + patLen <= (size_t)want) {
+                    const u8* q = memFind(buf + idx, (size_t)want - idx, opt.pattern.data(), patLen);
+                    if (!q) break;
+                    size_t qIdx = (size_t)(q - buf);
+                    if (!handleHit(phys + (u64)qIdx)) break;
+                    idx = qIdx + 1;
                 }
-                if (opt.limit && hits >= opt.limit) break;
-            } else {
-                // JSON：匹配成对花括号
+
+                // 2) 跨块边界：用单独的小窗口比对，不动 buf
+                if (!carry.empty() && !(opt.limit && hits >= opt.limit)) {
+                    u8 small[160];
+                    size_t t = carry.size();
+                    size_t take = std::min<size_t>((size_t)want, patLen - 1);
+                    if (t + take <= sizeof(small)) {
+                        memcpy(small, carry.data(), t);
+                        memcpy(small + t, buf, take);
+                        size_t tot = t + take;
+                        for (size_t sp = 0; sp + patLen <= tot; sp++) {
+                            if (sp + patLen <= t) continue;   // 完全落在上一块，已经搜过
+                            if (memcmp(small + sp, opt.pattern.data(), patLen) != 0) continue;
+                            u64 abs = phys - (u64)t + (u64)sp;
+                            if (!handleHit(abs)) break;
+                        }
+                    }
+                }
+
+                // 3) 记录本块尾部，供下一块边界比对
+                if (patLen > 1) {
+                    size_t keep = std::min<size_t>((size_t)want, patLen - 1);
+                    carry.assign(buf + want - keep, buf + want);
+                }
+            } else if (opt.jsonMode) {
+                // JSON：匹配成对花括号（只处理完全落在本块内的对象）
                 size_t i = 0;
                 while (i < want) {
                     if (buf[i] != '{') { i++; continue; }
@@ -608,7 +654,7 @@ static bool carve(ScanCtx& ctx, const vector<Run>& scanRuns, const CarveOpt& opt
                     size_t j = i;
                     bool inStr = false, esc = false;
                     bool ok = false;
-                    size_t lim = std::min<size_t>(want, i + (size_t)opt.maxSize);
+                    size_t lim = std::min<size_t>((size_t)want, i + (size_t)opt.maxSize);
                     for (; j < lim; j++) {
                         u8 c = buf[j];
                         if (inStr) {
@@ -646,6 +692,8 @@ static bool carve(ScanCtx& ctx, const vector<Run>& scanRuns, const CarveOpt& opt
                 }
             }
 
+            pos += want;   // 块内偏移必须前进
+
             QueryPerformanceCounter(&t1);
             double secs = (double)(t1.QuadPart - t0.QuadPart) / (double)freq.QuadPart;
             progress(opt.jsonMode ? "JSON" : "扫描", done, totalBytes, secs, hits);
@@ -669,7 +717,7 @@ static bool carve(ScanCtx& ctx, const vector<Run>& scanRuns, const CarveOpt& opt
 static void help() {
     out(
     "StaDiskReset —— 磁盘已删除文件恢复 / 内容特征扫描\n"
-    "版本 1.1.0   只读工具，不会修改源盘\n\n"
+    "版本 1.1.2   只读工具，不会修改源盘\n\n"
     "用法：\n"
     "  StaDiskReset --info   E:\n"
     "  StaDiskReset --list   E:  [--all] [--name \"*.json\"] [--limit 50]\n"
@@ -772,7 +820,7 @@ static int runArgs(const vector<string>& args) {
     Volume vol;
     if (!vol.open((wchar_t)L, err)) { printf("打开 %c: 失败：%s\n", L, err.c_str()); return 1; }
 
-    printf("StaDiskReset 1.1.0   源卷 %c:\n", L);
+    printf("StaDiskReset 1.1.2   源卷 %c:\n", L);
     printf("  簇大小 %s   总簇数 %llu   容量 %s\n\n",
            fmtSize(vol.clusterSize).c_str(), (unsigned long long)vol.totalClusters,
            fmtSize(vol.clusterSize * vol.totalClusters).c_str());
@@ -818,27 +866,48 @@ static int runArgs(const vector<string>& args) {
                    fmtSize(e.dataSize).c_str(), fmtTime(e.mtime).c_str(), path.c_str());
             if (mode == "recover" && !e.isDir) {
                 if (outDir.empty()) { out("\n恢复需要 --out 指定输出目录\n"); return 1; }
-                if (!e.hasData || e.runs.empty()) { out("  （无数据，跳过）\n"); }
+                bool isResident = !e.resident.empty();
+                if (!isResident && (!e.hasData || e.runs.empty())) { out("  （无数据，跳过）\n"); }
                 else {
                     u64 sz = e.dataSize;
-                    u8* buf = (u8*)malloc((size_t)std::min<u64>(sz, 16ull << 20));
-                    u64 written = 0;
-                    wstring outPath = U2W(outDir) + L"\\" + U2W(e.name);
-                    HANDLE fh = CreateFileW(outPath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+                    wstring dir = U2W(outDir);
+                    wstring baseName = U2W(e.name);
+                    wstring outPath = dir + L"\\" + baseName;
+                    // 重名自动改名：a.json -> a.1.json
+                    for (int dup = 1; dup < 1000 && GetFileAttributesW(outPath.c_str()) != INVALID_FILE_ATTRIBUTES; dup++) {
+                        wchar_t suf[16];
+                        swprintf(suf, 16, L".%d", dup);
+                        size_t dot = baseName.rfind(L'.');
+                        wstring cand = (dot == wstring::npos || dot == 0)
+                                         ? baseName + suf
+                                         : baseName.substr(0, dot) + suf + baseName.substr(dot);
+                        outPath = dir + L"\\" + cand;
+                    }
+                    HANDLE fh = CreateFileW(outPath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, 0, nullptr);
                     if (fh == INVALID_HANDLE_VALUE) {
                         printf("  写入失败（可能重名）：%s\n", W2U(outPath).c_str());
                     } else {
-                        while (written < sz) {
-                            u32 want = (u32)std::min<u64>(16ull << 20, sz - written);
-                            if (!vol.readStream(e.runs, written, buf, want, sz)) break;
+                        u64 written = 0;
+                        if (isResident) {
                             DWORD wr = 0;
-                            if (!WriteFile(fh, buf, want, &wr, nullptr) || wr != want) break;
-                            written += wr;
+                            if (WriteFile(fh, e.resident.data(), (DWORD)e.resident.size(), &wr, nullptr))
+                                written = wr;
+                            sz = written;
+                        } else {
+                            u8* buf = (u8*)malloc((size_t)std::min<u64>(sz, 16ull << 20));
+                            while (written < sz) {
+                                u32 want = (u32)std::min<u64>(16ull << 20, sz - written);
+                                if (!vol.readStream(e.runs, written, buf, want, sz)) break;
+                                DWORD wr = 0;
+                                if (!WriteFile(fh, buf, want, &wr, nullptr) || wr != want) break;
+                                written += wr;
+                            }
+                            free(buf);
                         }
                         CloseHandle(fh);
-                            printf("  已恢复 %s -> %s\n", fmtSize(written).c_str(), W2U(outPath).c_str());
+                        printf("  已恢复 %s -> %s%s\n", fmtSize(written).c_str(), W2U(outPath).c_str(),
+                               isResident ? "（常驻数据）" : "");
                     }
-                    free(buf);
                 }
             }
             if (limit && ++shown >= limit) break;
@@ -862,15 +931,12 @@ static int runArgs(const vector<string>& args) {
             if (extract != "json") { out("目前 --extract 只支持 json\n"); return 1; }
             opt.jsonMode = true;
         } else if (!patternHex.empty()) {
-            const char* s = patternHex.c_str();
-            while (*s) {
-                while (*s == ' ' || *s == ',' || *s == '-') s++;
-                if (!*s) break;
-                char b[3] = { s[0], (char)((s[1] && s[1] != ' ') ? s[1] : 0), 0 };
-                if (!b[1]) break;
-                opt.pattern.push_back((u8)strtol(b, nullptr, 16));
-                s += 2;
-            }
+            string hex;
+            for (char c : patternHex) if (isxdigit((unsigned char)c)) hex.push_back(c);
+            if (hex.size() % 2) hex.pop_back();
+            for (size_t i = 0; i + 1 < hex.size(); i += 2)
+                opt.pattern.push_back((u8)strtol(hex.substr(i, 2).c_str(), nullptr, 16));
+            if (opt.pattern.empty()) { out("十六进制特征串解析失败\n"); return 1; }
         } else if (!pattern.empty()) {
             opt.pattern.assign(pattern.begin(), pattern.end());
         } else {
@@ -970,7 +1036,7 @@ static int interactiveMenu() {
 TOP:
     system("cls");
     cout << "===============================================" << endl;
-    cout << "        StaDiskReset 1.1.1  磁盘恢复工具箱" << endl;
+    cout << "        StaDiskReset 1.1.2  磁盘恢复工具箱" << endl;
     cout << "          双击即用 · 只读不写源盘" << endl;
     cout << "===============================================" << endl;
     cout << "1. 卷信息（簇大小 / MFT 位置）" << endl;
