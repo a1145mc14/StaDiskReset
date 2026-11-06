@@ -2,3 +2,6 @@
 *.zip
 *.pdb
 .vs/
+*.bat
+fix_*.py
+patch_*.py
