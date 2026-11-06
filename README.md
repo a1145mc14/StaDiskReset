@@ -140,7 +140,7 @@ MSVC 也可以，把 `CommandLineToArgvW` 需要的 `shell32.lib` 带上即可�
 
 MIT License，见 [LICENSE](LICENSE)。
 
-- 作者：**adofai**
+- 作者：**C艹是adofai**
 - 说明：AI 辅助生成的部分不主张版权，本项目整体以 MIT 协议发布
 - 起因：为了抢救被 UnityModManager 卸载掉的 KeyViewer 皮肤档案
 
