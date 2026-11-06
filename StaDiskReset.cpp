@@ -17,6 +17,8 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <iostream>
+#include <cctype>
 #include <io.h>
 
 using std::string;
@@ -663,7 +665,7 @@ static bool carve(ScanCtx& ctx, const vector<Run>& scanRuns, const CarveOpt& opt
 static void help() {
     out(
     "StaDiskReset —— 磁盘已删除文件恢复 / 内容特征扫描\n"
-    "版本 1.0   只读工具，不会修改源盘\n\n"
+    "版本 1.1.0   只读工具，不会修改源盘\n\n"
     "用法：\n"
     "  StaDiskReset --info   E:\n"
     "  StaDiskReset --list   E:  [--all] [--name \"*.json\"] [--limit 50]\n"
@@ -695,8 +697,11 @@ static void help() {
 }
 
 // ---------------------------------------------------------------------------
-// main
+// 入口
 // ---------------------------------------------------------------------------
+static int runArgs(const vector<string>& args);
+static int interactiveMenu();
+
 int main() {
     // 中文不乱码：控制台代码页切到 UTF-8
     system("chcp 65001 >nul");
@@ -711,8 +716,14 @@ int main() {
     for (int i = 1; i < argc; i++) args.push_back(W2U(argvW[i]));
     LocalFree(argvW);
 
-    if (args.empty()) { help(); return 0; }
+    if (args.empty()) return interactiveMenu();
+    return runArgs(args);
+}
 
+// ---------------------------------------------------------------------------
+// 命令行模式
+// ---------------------------------------------------------------------------
+static int runArgs(const vector<string>& args) {
     string mode, volStr, outDir, namePat = "*", pattern, patternHex, extract;
     bool allFlag = false, whole = false;
     u64 limit = 0;
@@ -757,7 +768,7 @@ int main() {
     Volume vol;
     if (!vol.open((wchar_t)L, err)) { printf("打开 %c: 失败：%s\n", L, err.c_str()); return 1; }
 
-    printf("StaDiskReset 1.0   源卷 %c:\n", L);
+    printf("StaDiskReset 1.1.0   源卷 %c:\n", L);
     printf("  簇大小 %s   总簇数 %llu   容量 %s\n\n",
            fmtSize(vol.clusterSize).c_str(), (unsigned long long)vol.totalClusters,
            fmtSize(vol.clusterSize * vol.totalClusters).c_str());
@@ -884,4 +895,119 @@ int main() {
 
     help();
     return 0;
+}
+
+// ---------------------------------------------------------------------------
+// 交互式工具箱：双击运行、输数字即可
+// ---------------------------------------------------------------------------
+static string promptLine(const char* msg) {
+    printf("%s", msg);
+    fflush(stdout);
+    string s;
+    if (!std::getline(std::cin, s)) return string();
+    while (!s.empty() && (s.back() == '\r' || s.back() == '\n' || s.back() == ' ' || s.back() == '\t')) s.pop_back();
+    size_t i = 0;
+    while (i < s.size() && (s[i] == ' ' || s[i] == '\t')) i++;
+    return s.substr(i);
+}
+
+static char promptDrive() {
+    string s = promptLine("  请输入盘符（例如 E，直接回车返回菜单）: ");
+    for (char c : s) if (isalpha((unsigned char)c)) return (char)toupper((unsigned char)c);
+    return 0;
+}
+
+static string promptOutDir() {
+    string s = promptLine("  输出目录（回车默认 D:\\SDR_Recover）: ");
+    return s.empty() ? string("D:\\SDR_Recover") : s;
+}
+
+static void pauseKey() {
+    printf("\n  按回车键继续 ...");
+    fflush(stdout);
+    string s;
+    std::getline(std::cin, s);
+}
+static int interactiveMenu() {
+    for (;;) {
+        system("cls");
+        puts("  ==================================================");
+        puts("   StaDiskReset 1.1.0   磁盘恢复工具箱");
+        puts("  ==================================================");
+        puts("    [1] 卷信息（簇大小 / MFT 位置）");
+        puts("    [2] 列出已删除的文件");
+        puts("    [3] 按文件名恢复");
+        puts("    [4] 按内容特征扫描（字符串）");
+        puts("    [5] 按 JSON 结构提取");
+        puts("    [6] 查看完整帮助");
+        puts("    [0] 退出");
+        puts("  --------------------------------------------------");
+
+        string ch = promptLine("  请输入序号: ");
+        if (ch.empty()) continue;
+
+        int sel = -1;
+        if (ch.size() == 1 && isdigit((unsigned char)ch[0])) sel = ch[0] - '0';
+        else if (ch == "q" || ch == "Q") sel = 0;
+
+        switch (sel) {
+            case 0:
+                return 0;
+            case 6:
+                system("cls");
+                help();
+                pauseKey();
+                continue;
+            case 1: case 2: case 3: case 4: case 5:
+                break;
+            default:
+                puts("  没有这个选项，请输入 0-6");
+                pauseKey();
+                continue;
+        }
+
+        char L = promptDrive();
+        if (!L) continue;
+        string vol; vol += L; vol += ':';
+
+        vector<string> a;
+        switch (sel) {
+            case 1:
+                a = { "--info", vol };
+                break;
+            case 2: {
+                string name = promptLine("  文件名过滤（支持 *，回车=全部）: ");
+                a = { "--list", vol };
+                if (!name.empty()) { a.push_back("--name"); a.push_back(name); }
+                a.push_back("--limit"); a.push_back("50");
+                break;
+            }
+            case 3: {
+                string name = promptLine("  要恢复的文件名（支持 *，如 hyw.json）: ");
+                if (name.empty()) { puts("  文件名不能为空"); pauseKey(); continue; }
+                a = { "--recover", vol, "--name", name, "--out", promptOutDir() };
+                break;
+            }
+            case 4: {
+                string pat = promptLine("  要搜索的特征字符串: ");
+                if (pat.empty()) { puts("  特征串不能为空"); pauseKey(); continue; }
+                a = { "--carve", vol, "--pattern", pat, "--out", promptOutDir(), "--limit", "20" };
+                break;
+            }
+            case 5: {
+                string o = promptOutDir();
+                string mn = promptLine("  最小字节数（回车默认 1024）: ");
+                if (mn.empty()) mn = "1024";
+                a = { "--carve", vol, "--extract", "json", "--min-size", mn, "--out", o, "--limit", "20" };
+                break;
+            }
+            default:
+                continue;
+        }
+
+        printf("\n");
+        int rc = runArgs(a);
+        printf("\n  [操作结束，返回码 %d]\n", rc);
+        pauseKey();
+    }
 }
