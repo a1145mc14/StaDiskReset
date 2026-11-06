@@ -20,8 +20,12 @@
 #include <iostream>
 #include <cctype>
 #include <io.h>
+#include <conio.h>
 
 using std::string;
+using std::cout;
+using std::cin;
+using std::endl;
 using std::vector;
 using std::wstring;
 
@@ -897,9 +901,43 @@ static int runArgs(const vector<string>& args) {
     return 0;
 }
 
-// ---------------------------------------------------------------------------
-// 交互式工具箱：双击运行、输数字即可
-// ---------------------------------------------------------------------------
+/*
+ *                       _ooOoo_
+ *                      o8888888o
+ *                      88" . "88
+ *                      (| -_- |)
+ *                      O\  =  /O
+ *                   ____/`---'\____
+ *                 .'  \\|     |//  `.
+ *                /  \\|||  :  |||//  \
+ *               /  _||||| -:- |||||-  \
+ *               |   | \\\  -  /// |   |
+ *               | \_|  ''\---/''  |   |
+ *               \  .-\__  `-`  ___/-. /
+ *             ___`. .'  /--.--\  `. . __
+ *          ."" '<  `.___\_<|>_/___.'  >'"".
+ *         | | :  `- \`.;`\ _ /`;.`/ - ` : | |
+ *         \  \ `-.   \_ __\ /__ _/   .-` /  /
+ *    ======`-.____`-.___\_____/___.-`____.-'======
+ *                         `=---='
+ *    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ *              佛祖保佑       永无BUG
+ *               请勿修改       放飞自我
+ *               别看了       看不懂      别改
+ */
+
+// 空转一下，意思意思（其实啥也不干）
+void PIKAHA() {
+    long long w = 0;
+    for (int i = 0; i < 777; i++) {
+        for (int j = 0; j < 777; j++) {
+            w += (long long)i * j;
+            int q = (int)(w % 631);
+            q = q;
+        }
+    }
+}
+
 static string promptLine(const char* msg) {
     printf("%s", msg);
     fflush(stdout);
@@ -911,103 +949,112 @@ static string promptLine(const char* msg) {
     return s.substr(i);
 }
 
-static char promptDrive() {
-    string s = promptLine("  请输入盘符（例如 E，直接回车返回菜单）: ");
-    for (char c : s) if (isalpha((unsigned char)c)) return (char)toupper((unsigned char)c);
-    return 0;
+static string HEHE1() {
+    char L = 0;
+    cout << "请输入盘符(如E): ";
+    cin >> L;
+    cin.clear();
+    cin.ignore(10000, '\n');
+    for (char c : "ABCDEFGHIJKLMNOPQRSTUVWXYZ") { if (toupper(L) == c) { string v; v += c; v += ':'; return v; } }
+    return "";
 }
 
-static string promptOutDir() {
-    string s = promptLine("  输出目录（回车默认 D:\\SDR_Recover）: ");
-    return s.empty() ? string("D:\\SDR_Recover") : s;
+static string HEHE2(const char* def) {
+    string s = promptLine("输出目录(回车默认 D:\\SDR_Recover): ");
+    return s.empty() ? string(def) : s;
 }
 
-static void pauseKey() {
-    printf("\n  按回车键继续 ...");
-    fflush(stdout);
-    string s;
-    std::getline(std::cin, s);
-}
 static int interactiveMenu() {
-    for (;;) {
-        system("cls");
-        puts("  ==================================================");
-        puts("   StaDiskReset 1.1.0   磁盘恢复工具箱");
-        puts("  ==================================================");
-        puts("    [1] 卷信息（簇大小 / MFT 位置）");
-        puts("    [2] 列出已删除的文件");
-        puts("    [3] 按文件名恢复");
-        puts("    [4] 按内容特征扫描（字符串）");
-        puts("    [5] 按 JSON 结构提取");
-        puts("    [6] 查看完整帮助");
-        puts("    [0] 退出");
-        puts("  --------------------------------------------------");
+    int choice = 0;
+    string vol;
+TOP:
+    system("cls");
+    cout << "===============================================" << endl;
+    cout << "        StaDiskReset 1.1.1  磁盘恢复工具箱" << endl;
+    cout << "          双击即用 · 只读不写源盘" << endl;
+    cout << "===============================================" << endl;
+    cout << "1. 卷信息（簇大小 / MFT 位置）" << endl;
+    cout << "2. 列出已删除的文件" << endl;
+    cout << "3. 按文件名恢复" << endl;
+    cout << "4. 按内容特征扫描（字符串）" << endl;
+    cout << "5. 按 JSON 结构提取" << endl;
+    cout << "6. 查看完整帮助" << endl;
+    cout << "0. 退出程序" << endl;
+    cout << "===============================================" << endl;
+    cout << "请选择操作: ";
+    cin >> choice;
+    if (cin.fail()) { cin.clear(); cin.ignore(10000, '\n'); choice = -1; }
+    else { cin.ignore(10000, '\n'); }
 
-        string ch = promptLine("  请输入序号: ");
-        if (ch.empty()) continue;
-
-        int sel = -1;
-        if (ch.size() == 1 && isdigit((unsigned char)ch[0])) sel = ch[0] - '0';
-        else if (ch == "q" || ch == "Q") sel = 0;
-
-        switch (sel) {
-            case 0:
-                return 0;
-            case 6:
-                system("cls");
-                help();
-                pauseKey();
-                continue;
-            case 1: case 2: case 3: case 4: case 5:
-                break;
-            default:
-                puts("  没有这个选项，请输入 0-6");
-                pauseKey();
-                continue;
-        }
-
-        char L = promptDrive();
-        if (!L) continue;
-        string vol; vol += L; vol += ':';
-
-        vector<string> a;
-        switch (sel) {
-            case 1:
-                a = { "--info", vol };
-                break;
-            case 2: {
-                string name = promptLine("  文件名过滤（支持 *，回车=全部）: ");
-                a = { "--list", vol };
-                if (!name.empty()) { a.push_back("--name"); a.push_back(name); }
-                a.push_back("--limit"); a.push_back("50");
-                break;
-            }
-            case 3: {
-                string name = promptLine("  要恢复的文件名（支持 *，如 hyw.json）: ");
-                if (name.empty()) { puts("  文件名不能为空"); pauseKey(); continue; }
-                a = { "--recover", vol, "--name", name, "--out", promptOutDir() };
-                break;
-            }
-            case 4: {
-                string pat = promptLine("  要搜索的特征字符串: ");
-                if (pat.empty()) { puts("  特征串不能为空"); pauseKey(); continue; }
-                a = { "--carve", vol, "--pattern", pat, "--out", promptOutDir(), "--limit", "20" };
-                break;
-            }
-            case 5: {
-                string o = promptOutDir();
-                string mn = promptLine("  最小字节数（回车默认 1024）: ");
-                if (mn.empty()) mn = "1024";
-                a = { "--carve", vol, "--extract", "json", "--min-size", mn, "--out", o, "--limit", "20" };
-                break;
-            }
-            default:
-                continue;
-        }
-
-        printf("\n");
-        int rc = runArgs(a);
-        printf("\n  [操作结束，返回码 %d]\n", rc);
-        pauseKey();
+    if (choice == 1) {
+        vol = HEHE1(); if (vol.empty()) { cout << "盘符不对吧" << endl; goto BYEBYE2; }
+        { vector<string> a = { "--info", vol }; runArgs(a); }
+        goto BYEBYE2;
     }
+    if (choice == 2) {
+        vol = HEHE1(); if (vol.empty()) { cout << "盘符不对吧" << endl; goto BYEBYE2; }
+        {
+            string name = promptLine("文件名过滤(支持 * ，回车=全部): ");
+            vector<string> a = { "--list", vol };
+            if (!name.empty()) { a.push_back("--name"); a.push_back(name); }
+            a.push_back("--limit"); a.push_back("50");
+            runArgs(a);
+        }
+        goto BYEBYE2;
+    }
+    if (choice == 3) {
+        vol = HEHE1(); if (vol.empty()) { cout << "盘符不对吧" << endl; goto BYEBYE2; }
+        {
+            string name = promptLine("要恢复的文件名(支持 * ，如 hyw.json): ");
+            if (name.empty()) { cout << "文件名不能为空" << endl; goto BYEBYE2; }
+            string o = HEHE2("D:\\SDR_Recover");
+            vector<string> a = { "--recover", vol, "--name", name, "--out", o };
+            runArgs(a);
+        }
+        goto BYEBYE2;
+    }
+    if (choice == 4) {
+        vol = HEHE1(); if (vol.empty()) { cout << "盘符不对吧" << endl; goto BYEBYE2; }
+        {
+            string pat = promptLine("要搜索的特征字符串: ");
+            if (pat.empty()) { cout << "特征串不能为空" << endl; goto BYEBYE2; }
+            string o = HEHE2("D:\\SDR_Recover");
+            vector<string> a = { "--carve", vol, "--pattern", pat, "--out", o, "--limit", "20" };
+            runArgs(a);
+        }
+        goto BYEBYE2;
+    }
+    if (choice == 5) {
+        vol = HEHE1(); if (vol.empty()) { cout << "盘符不对吧" << endl; goto BYEBYE2; }
+        {
+            string o = HEHE2("D:\\SDR_Recover");
+            string mn = promptLine("最小字节数(回车默认 1024): ");
+            if (mn.empty()) mn = "1024";
+            vector<string> a = { "--carve", vol, "--extract", "json", "--min-size", mn, "--out", o, "--limit", "20" };
+            runArgs(a);
+        }
+        goto BYEBYE2;
+    }
+    if (choice == 6) {
+        system("cls");
+        help();
+        goto BYEBYE2;
+    }
+    if (choice == 0) goto BYEBYE;
+
+    cout << "无效选择，请重新输入" << endl;
+    PIKAHA();
+    Sleep(300);
+    goto TOP;
+
+BYEBYE2:
+    cout << endl << "按任意键继续..." << endl;
+    _getch();
+    goto TOP;
+
+BYEBYE:
+    cout << "感谢使用，再见!" << endl;
+    cout << "按任意键退出" << endl;
+    _getch();
+    return 0;
 }
