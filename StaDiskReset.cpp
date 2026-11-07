@@ -536,6 +536,28 @@ static bool writeFileBytes(const string& path, const u8* data, u32 len) {
     return ok;
 }
 
+// 判断一段字节是否像文本 JSON：无 NUL、UTF-8 合法、控制字符极少
+static bool looksJson(const u8* p, size_t n) {
+    if (n == 0 || memchr(p, 0, n)) return false;
+    size_t ctrl = 0, i = 0;
+    while (i < n) {
+        u8 c = p[i];
+        if (c < 0x80) {
+            if (c < 0x20 && c != '\t' && c != '\r' && c != '\n') ctrl++;
+            i++;
+        } else {
+            int need;
+            if ((c & 0xE0) == 0xC0) need = 1;
+            else if ((c & 0xF0) == 0xE0) need = 2;
+            else if ((c & 0xF8) == 0xF0) need = 3;
+            else return false;
+            if (i + (size_t)need >= n) return false;
+            for (int k = 1; k <= need; k++) if ((p[i + k] & 0xC0) != 0x80) return false;
+            i += (size_t)need + 1;
+        }
+    }
+    return ctrl * 100 <= n;   // 控制字符超过 1% 视为二进制
+}
 static const u8* memFind(const u8* hay, size_t n, const u8* pat, size_t m) {
     if (m == 0 || n < m) return nullptr;
     const u8* p = hay;
@@ -561,7 +583,8 @@ static bool carve(ScanCtx& ctx, const vector<Run>& scanRuns, const CarveOpt& opt
     if (!buf) { err = "内存分配失败"; return false; }
 
     const size_t patLen = opt.pattern.size();
-    vector<u8> carry;      // 上一块末尾的 patLen-1 字节
+    vector<u8> carry;      // 上一块末尾的 patLen-1 字节（pattern 模式）
+    vector<u8> jsonCarry;  // 上一块末尾 maxSize 字节（JSON 模式，用于跨块拼接）
 
     u64 done = 0, hits = 0;
     LARGE_INTEGER freq, t0, t1;
@@ -574,6 +597,7 @@ static bool carve(ScanCtx& ctx, const vector<Run>& scanRuns, const CarveOpt& opt
         u64 bytes = r.count * v.clusterSize;
         u64 pos = 0;
         carry.clear();     // run 之间物理不连续，不能跨块拼接
+        jsonCarry.clear();
         while (pos < bytes) {
             u32 want = (u32)std::min<u64>(CHUNK, bytes - pos);
             u64 phys = (u64)r.lcn * v.clusterSize + pos;
@@ -645,17 +669,31 @@ static bool carve(ScanCtx& ctx, const vector<Run>& scanRuns, const CarveOpt& opt
                     carry.assign(buf + want - keep, buf + want);
                 }
             } else if (opt.jsonMode) {
-                // JSON：匹配成对花括号（只处理完全落在本块内的对象）
+                // JSON：跨块用 carry 拼接。只接受"结束位置越过 carry 区"的对象，
+                // 完全落在 carry 里的对象上一块已处理过，跳过可避免重复提取。
+                size_t t = jsonCarry.size();
+                std::vector<u8> big;
+                const u8* src;
+                size_t tot;
+                if (t == 0) {
+                    src = buf; tot = want;
+                } else {
+                    big.resize(t + want);
+                    memcpy(big.data(), jsonCarry.data(), t);
+                    memcpy(big.data() + t, buf, want);
+                    src = big.data(); tot = t + want;
+                }
+
                 size_t i = 0;
-                while (i < want) {
-                    if (buf[i] != '{') { i++; continue; }
+                while (i < tot) {
+                    if (src[i] != '{') { i++; continue; }
                     u32 depth = 0;
                     size_t j = i;
                     bool inStr = false, esc = false;
                     bool ok = false;
-                    size_t lim = std::min<size_t>((size_t)want, i + (size_t)opt.maxSize);
+                    size_t lim = std::min<size_t>(tot, i + (size_t)opt.maxSize);
                     for (; j < lim; j++) {
-                        u8 c = buf[j];
+                        u8 c = src[j];
                         if (inStr) {
                             if (esc) esc = false;
                             else if (c == '\\') esc = true;
@@ -669,9 +707,10 @@ static bool carve(ScanCtx& ctx, const vector<Run>& scanRuns, const CarveOpt& opt
                             if (depth == 0) { ok = true; j++; break; }
                         }
                     }
-                    if (ok && (j - i) >= opt.minSize && memchr(buf + i, ':', j - i)) {
+                    if (ok && j > t && (j - i) >= opt.minSize && memchr(src + i, ':', j - i)
+                        && looksJson(src + i, j - i)) {
                         hits++;
-                        u64 abs = phys + i;
+                        u64 abs = (phys >= (u64)t ? phys - (u64)t : 0) + (u64)i;
                         char line[256];
                         snprintf(line, sizeof line, "\n  JSON 对象 #%llu  偏移 0x%llX  大小 %llu B\n",
                                  (unsigned long long)hits, (unsigned long long)abs,
@@ -681,13 +720,20 @@ static bool carve(ScanCtx& ctx, const vector<Run>& scanRuns, const CarveOpt& opt
                             char name[512];
                             snprintf(name, sizeof name, "%s\\json_%016llX.json", opt.outDir.c_str(),
                                      (unsigned long long)abs);
-                            if (writeFileBytes(name, buf + i, (u32)(j - i))) out("  已保存 JSON\n");
+                            if (writeFileBytes(name, src + i, (u32)(j - i))) out("  已保存 JSON\n");
                         }
                         i = j;
                         if (opt.limit && hits >= opt.limit) break;
                     } else {
-                        i++;
+                        i = ok ? j : i + 1;
                     }
+                }
+
+                // 保留本块尾部 maxSize 字节（上限一个 CHUNK），供下一块续接
+                size_t cap = std::min<size_t>((size_t)opt.maxSize, (size_t)CHUNK);
+                if (cap > 0) {
+                    size_t keep = std::min<size_t>((size_t)want, cap);
+                    jsonCarry.assign(buf + want - keep, buf + want);
                 }
             }
 
